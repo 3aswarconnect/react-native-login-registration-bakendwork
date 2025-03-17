@@ -5,6 +5,7 @@ import multer from 'multer';
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
 import  { DynamoDBClient, PutItemCommand, GetItemCommand,ScanCommand,QueryCommand } from "@aws-sdk/client-dynamodb";
 import crypto from "crypto";
+import { unmarshall } from '@aws-sdk/util-dynamodb';
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
 dotenv.config()
@@ -12,7 +13,7 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 app.use(express.urlencoded({ extended: true }))
-
+app.use(cors({ origin: "*" }));
 //s3
 const s3 = new S3Client({
     region: process.env.AWS_REGION,
@@ -179,6 +180,25 @@ app.post('/upload', upload.single('file'), async (req, res) => {
     }
 });
 
+
+
+app.get('/reels', async (req, res) => {
+    const category = req.query.category;
+    console.log(category);
+
+    try {
+        const data = await client.send(new ScanCommand({ TableName: 'storage' }));
+        let videos = data.Items.map(item => unmarshall(item)).filter(video => video.fileType === 'video');
+
+        if (category && category !== 'All') {
+            videos = videos.filter(video => video.category === category);
+        }
+
+        res.json(videos);
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching videos: ' + error.message });
+    }
+});
 
 
 // **Start Server**

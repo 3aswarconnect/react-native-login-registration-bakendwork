@@ -3,11 +3,12 @@ import express from 'express'
 import cors from "cors";
 import multer from 'multer';
 import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
-import  { DynamoDBClient, PutItemCommand, GetItemCommand,ScanCommand,QueryCommand } from "@aws-sdk/client-dynamodb";
+import  { DynamoDBClient, PutItemCommand, GetItemCommand,ScanCommand,QueryCommand,UpdateItemCommand  } from "@aws-sdk/client-dynamodb";
 import crypto from "crypto";
 import { unmarshall } from '@aws-sdk/util-dynamodb';
 import path from "path";
 import { v4 as uuidv4 } from "uuid";
+
 dotenv.config()
 const app = express();
 app.use(cors());
@@ -96,7 +97,7 @@ app.post("/register", async (req, res) => {
 app.post("/signin", async (req, res) => {
     const TABLE_NAME = 'youtube-demos';
     const { identifier, password } = req.body; // identifier can be email or username
-    console.log(req.body);
+    
 
     if (!identifier || !password) {
         return res.status(400).json({ message: "Username/Email and Password are required" });
@@ -120,7 +121,12 @@ app.post("/signin", async (req, res) => {
         const user = response.Items[0];
         
         if (user.password?.S === password) {
-            res.json({ message: "Login successful", userId: user.userId?.S });
+            res.json({
+                message: "Login successful",
+                userId: user.userId?.S,
+                username: user.username?.S, // Add username
+                email: user.email?.S // Add email
+            });
         } else {
             res.status(401).json({ message: "Invalid credentials" });
         }
@@ -138,43 +144,71 @@ const upload = multer({ storage });
 // Upload API
 
 
-app.post('/upload', upload.single('file'), async (req, res) => {
-    console.log(req.file, req.body);
+app.post('/upload', upload.fields([{ name: 'file' }, { name: 'docfile' }]), async (req, res) => {
+   
+    
     const { category, description, isPublic, userId } = req.body;
-
     if (!userId) return res.status(400).json({ message: 'User ID is required' });
-    if (!req.file) return res.status(400).json({ message: 'No file uploaded' });
+    if (!req.files || !req.files.file) return res.status(400).json({ message: 'No file uploaded' });
 
     try {
-        const fileId = uuidv4(); // Generate unique file ID
-        const fileType = req.file.mimetype.startsWith('image') ? 'image' : 'video'; // Determine file type
-        const fileName = `${fileId}-${req.file.originalname}`;
+        const file = req.files.file[0];
+        const fileId = uuidv4();
+        const fileType = file.mimetype.startsWith('image') ? 'image' : 'video';
+        const fileName = `${fileId}-${file.originalname}`;
         const fileUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
 
-        // Upload to S3
+        // Upload main file to S3
         await s3.send(new PutObjectCommand({
             Bucket: process.env.AWS_S3_BUCKET,
             Key: fileName,
-            Body: req.file.buffer,
-            ContentType: req.file.mimetype,
+            Body: file.buffer,
+            ContentType: file.mimetype,
         }));
 
-        // Store in DynamoDB
+        let docFileUrl = null;
+        let docFileName = null;
+        console.log(req.files.docfile);
+        // If docfile is provided, upload it
+        if (req.files.docfile) {
+            const docfile = req.files.docfile[0];
+
+            const docFileId = uuidv4();
+            docFileName = `${docFileId}-${docfile.originalname}`;
+            docFileUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${docFileName}`;
+
+            await s3.send(new PutObjectCommand({
+                Bucket: process.env.AWS_S3_BUCKET,
+                Key: docFileName,
+                Body: docfile.buffer,
+                ContentType: docfile.mimetype,
+            }));
+        }
+
+        // Store details in DynamoDB
         await client.send(new PutItemCommand({
             TableName: 'storage',
             Item: {
-                fileId: { S: fileId },  // Unique File ID (Primary Key)
+                fileId: { S: fileId },
                 userId: { S: userId },
                 category: { S: category },
                 description: { S: description },
                 isPublic: { BOOL: isPublic === 'true' },
-                fileName: { S: req.file.originalname },
+                fileName: { S: file.originalname },
                 fileUrl: { S: fileUrl },
-                fileType: { S: fileType }  // Added attribute for file type
+                fileType: { S: fileType },
+                ...(docFileUrl && { docFileUrl: { S: docFileUrl } }),
+                ...(docFileName && { docFileName: { S: docFileName } }),
             },
         }));
 
-        res.json({ message: 'Upload successful', fileId, fileUrl, fileType });
+        res.json({ 
+            message: 'Upload successful', 
+            fileId, 
+            fileUrl, 
+            fileType,
+            docFileUrl 
+        });
     } catch (error) {
         res.status(500).json({ message: 'Upload failed: ' + error.message });
     }
@@ -184,7 +218,7 @@ app.post('/upload', upload.single('file'), async (req, res) => {
 
 app.get('/reels', async (req, res) => {
     const category = req.query.category;
-    console.log(category);
+   
 
     try {
         const data = await client.send(new ScanCommand({ TableName: 'storage' }));
@@ -197,6 +231,184 @@ app.get('/reels', async (req, res) => {
         res.json(videos);
     } catch (error) {
         res.status(500).json({ message: 'Error fetching videos: ' + error.message });
+    }
+});
+
+app.get('/memes', async (req, res) => {
+    const category = req.query.category;
+    
+
+
+    try {
+        const data = await client.send(new ScanCommand({ TableName: 'storage' }));
+        let memes = data.Items.map(item => unmarshall(item)).filter(meme => meme.fileType === 'image');
+
+        if (category && category !== 'All') {
+            memes = memes.filter(meme => meme.category === category);
+        }
+
+        res.json(memes);
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching memes: ' + error.message });
+    }
+});
+
+const photostorage = multer.memoryStorage();
+const photoupload = multer({ storage });
+
+// Profile Update API (POST)
+app.post('/profile-send', photoupload.single('file'), async (req, res) => {
+   
+    const { userId, username, name, bio, socialLinks } = req.body;
+  console.log(socialLinks);
+    if (!userId) return res.status(400).json({ message: 'User ID is required' });
+    
+    try {
+        // Create a DynamoDB item with the base profile data
+        const profileItem = {
+            userId: { S: userId },     // Primary Key (userId)
+            username: { S: username }, // Username
+            name: { S: name },         // User's name
+            bio: { S: bio },           // Bio
+        };
+        
+        // Handle file upload if a file is provided
+        if (req.file) {
+            // Generate unique file ID for the profile photo
+            const fileId = uuidv4(); 
+            const fileName = `${fileId}-${req.file.originalname}`;
+            const fileUrl = `https://${process.env.AWS_S3_BUCKET}.s3.${process.env.AWS_REGION}.amazonaws.com/${fileName}`;
+
+            // Upload the profile photo to S3
+            await s3.send(new PutObjectCommand({
+                Bucket: process.env.AWS_S3_BUCKET,
+                Key: fileName,
+                Body: req.file.buffer,
+                ContentType: req.file.mimetype,
+            }));
+            
+            // Add the profile photo URL to the DynamoDB item
+            profileItem.profilePhotoUrl = { S: fileUrl };
+        }
+        
+        // Handle social links if provided
+        if (socialLinks) {
+            try {
+                // Parse social links from JSON string to array
+                const parsedLinks = JSON.parse(socialLinks);
+                
+                // Validate social links
+                if (Array.isArray(parsedLinks) && parsedLinks.length <= 5) {
+                    // Add social links as a list of maps in DynamoDB
+                    profileItem.socialLinks = { 
+                        L: parsedLinks.map(link => ({
+                            M: {
+                                name: { S: link.name },
+                                url: { S: link.url },
+                                platform: { S: link.platform }
+                            }
+                        }))
+                    };
+                }
+            } catch (parseError) {
+                console.error('Error parsing social links:', parseError);
+                // Continue execution even if social links parsing fails
+            }
+        }
+
+        // Store profile data in DynamoDB
+        await client.send(new PutItemCommand({
+            TableName: 'profile', // Assuming 'profile' is the DynamoDB table name
+            Item: profileItem,
+        }));
+
+        // Respond back with success message and profile photo URL if it was updated
+        const response = {
+            message: 'Profile updated successfully'
+        };
+        
+        if (profileItem.profilePhotoUrl) {
+            response.profilePhotoUrl = profileItem.profilePhotoUrl.S;
+        }
+        
+        res.json(response);
+    } catch (error) {
+        console.error('Profile update error:', error);
+        res.status(500).json({ message: 'Profile update failed: ' + error.message });
+    }
+});
+
+app.get('/profileget', async (req, res) => {
+    const userId = req.query.userId;
+    
+    if (!userId) {
+        return res.status(400).json({ message: 'User ID is required' });
+    }
+    
+    try {
+        const data = await client.send(new ScanCommand({ TableName: 'profile' }));
+       
+        
+        // ✅ Fix: Correctly extract the userId from DynamoDB format
+        const userProfile = data.Items.find(user => user.userId.S === userId);
+        
+        if (!userProfile) {
+            return res.status(404).json({ message: 'Profile not found' });
+        }
+        
+        // ✅ Fix: Extract string values correctly and include socialLinks
+        const response = {
+            name: userProfile.name?.S || '',
+            bio: userProfile.bio?.S || '',
+            profilePic: userProfile.profilePhotoUrl?.S || '',
+            username: userProfile.username?.S || ''
+        };
+        
+        // Extract and transform socialLinks if they exist
+        if (userProfile.socialLinks && userProfile.socialLinks.L) {
+            response.socialLinks = userProfile.socialLinks.L.map(link => ({
+                name: link.M.name.S,
+                url: link.M.url.S,
+                platform: link.M.platform.S
+            }));
+        } else {
+            response.socialLinks = [];
+        }
+        
+        res.json(response);
+    } catch (error) {
+        res.status(500).json({ message: 'Error fetching profile: ' + error.message });
+    }
+});
+
+//profile user data
+app.get('/getUserMedia', async (req, res) => {
+    const { userId } = req.query;
+ console.log("user s sssss",userId);
+    if (!userId) {
+        return res.status(400).json({ message: "User ID is required" });
+    }
+
+    try {
+        // Fetch media items belonging to the user
+        const command = new ScanCommand({
+            TableName: 'storage', // Ensure this table stores user media
+            FilterExpression: "userId = :userId",
+            ExpressionAttributeValues: {
+                ":userId": { S: userId }
+            }
+        });
+
+        const data = await client.send(command);
+
+        // Convert DynamoDB response to normal JSON
+        const mediaItems = data.Items.map(item => unmarshall(item));
+       console.log(mediaItems);
+        res.json(mediaItems);
+        
+    } catch (error) {
+        console.error("Error fetching user media:", error);
+        res.status(500).json({ message: "Failed to fetch user media" });
     }
 });
 
